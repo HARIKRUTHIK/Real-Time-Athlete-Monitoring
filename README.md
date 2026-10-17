@@ -1,154 +1,186 @@
 # Real-Time Athlete Monitoring & Assistive Wearable System
+### Bio-Kinematic Motion Tracking, Clinical Photoplethysmography, and MCU-Level Fall Detection
 
 [![Platform: ESP32](https://img.shields.io/badge/Platform-ESP32%20%7C%20ESP32--S3-blue.svg)](https://www.espressif.com/)
-[![Sensors: MPU6050 | MAX30102](https://img.shields.io/badge/Sensors-MPU6050%20%7C%20MAX30102-green.svg)]()
-[![Stack: Node.js | React](https://img.shields.io/badge/FullStack-Node.js%20%7C%20React-61dafb.svg)]()
-[![Research: VIT Vellore](https://img.shields.io/badge/School-SENSE%20VIT%20Vellore-orange.svg)]()
+[![Sensors: MPU6050 | MAX30102](https://img.shields.io/badge/Sensors-MPU6050%20%7C%20MAX30102-green.svg)](docs/Sensors.pdf)
+[![Stack: Node.js | React](https://img.shields.io/badge/FullStack-Node.js%20%7C%20React%2018-61dafb.svg)](dashboard/)
+[![Research: VIT Vellore](https://img.shields.io/badge/Research-VIT%20SENSE%20Biomedical-orange.svg)](docs/Sensors.pdf)
+[![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
 
-A comprehensive wearable bio-kinetic monitoring and athletic assistive device built around the **ESP32/ESP32-S3**. Guided by **Dr. Zachariah C. Alex** at the School of Electronics Engineering (SENSE), VIT Vellore.
+An integrated, wearable bio-kinematic monitoring and clinical assistive system designed around the **ESP32 / ESP32-S3**. Guided by **Dr. Zachariah C. Alex** at the School of Electronics Engineering (SENSE), Vellore Institute of Technology (VIT), Vellore.
 
-The device combines high-speed biomechanical kinematics (squat repetition tracking, spine inclination/posture analysis) with clinical physiology (photoplethysmography heart rate, blood oxygen saturation $\text{SpO}_2$, and embedded ML fall detection), streaming real-time telemetry over Wi-Fi to a Node.js backend and an interactive React web dashboard.
+The system combines high-frequency biomechanical motion analysis (squat repetition counting, spine inclination, and Euler angle orientation) with clinical physiology (photoplethysmography heart rate, blood oxygen saturation $\text{SpO}_2$, and embedded Random Forest fall detection). Real-time telemetry streams over dual-band Wi-Fi to a reactive Node.js backend and an interactive 3D/chart React dashboard.
 
 ---
 
-## 1. System Architecture
+## 1. System Architecture & Dual-Rate Scheduler
 
 ```
-                    ┌────────────────────────────┐
-                    │      ESP32 / ESP32-S3      │
-                    │ Multi-Rate Task Scheduler  │
-                    └──────┬──────────────┬──────┘
-                           │              │
-         200 Hz Kinematics │              │ 25 Hz Physiology
-                           ▼              ▼
-                    ┌────────────┐ ┌────────────┐
-                    │  MPU6050   │ │ MAX30102 / │
-                    │ 6-Axis IMU │ │  MAX30105  │
-                    └─────┬──────┘ └─────┬──────┘
-                          │              │
-                          │              │ 16-Tap FIR Denoising
-                          ▼              ▼
-                    ┌────────────┐ ┌────────────┐
-                    │  Squats /  │ │ HR (IBI) / │
-                    │  Posture   │ │ SpO2 Ratio │
-                    └─────┬──────┘ └─────┬──────┘
-                          │              │
-                          └──────┬───────┘
-                                 │
-                   Embedded ML   ▼
-                 ┌──────────────────────────────┐
-                 │ Random Forest Fall Detection │
-                 │    (18 ms MCU Inference)     │
-                 └──────────────┬───────────────┘
-                                │
-                                ├─────────────────────────┐
-                                ▼                         ▼
-                     ┌────────────────────┐    ┌────────────────────┐
-                     │ 128×64 OLED Screen │    │ Wi-Fi JSON Stream  │
-                     │  (Vitals + EEQA    │    │ (Node.js + React   │
-                     │   Encrypted QR)    │    │  Athlete Dashboard)│
-                     └────────────────────┘    └────────────────────┘
+                   +---------------------------------------------+
+                   |              ESP32 / ESP32-S3               |
+                   |      Multi-Rate Cooperative Scheduler       |
+                   +--------------+----------------+-------------+
+                                  |                |
+             200 Hz Kinematics    |                | 25 Hz Physiology
+             (5 ms deterministic) |                | (40 ms window)
+                                  v                v
+                   +--------------+----+    +------+-------------+
+                   |  MPU-6050         |    |  MAX30102 / 105    |
+                   |  6-Axis IMU (I2C) |    |  Pulse Oximeter    |
+                   +--------------+----+    +------+-------------+
+                                  |                |
+                                  |                | 16-Tap FIR Low-Pass Filter
+                                  v                v
+                   +--------------+----+    +------+-------------+
+                   | Euler Angle &     |    | Systolic Peak (IBI)|
+                   | Squat Rep Counter |    | SpO2 Ratio Engine  |
+                   +--------------+----+    +------+-------------+
+                                  |                |
+                                  +--------+-------+
+                                           |
+                              Embedded ML  v
+                   +-----------------------+---------------------+
+                   | Random Forest Classifier (C native via m2c) |
+                   | 18 Features, 18 ms Latency, 93.9% F1-Score  |
+                   +-----------------------+---------------------+
+                                           |
+                                  +--------+--------+
+                                  |                 |
+                                  v                 v
+                   +--------------+----+     +------+------------+
+                   | 128x64 OLED Screen|     | Wi-Fi WebSockets  |
+                   | Live Vitals & EEQA|     | Node.js Backend & |
+                   | Encrypted QR Code |     | React Dashboard   |
+                   +-------------------+     +-------------------+
 ```
 
 ---
 
-## 2. Multi-Rate Cooperative Firmware
+## 2. Mathematical Formulations
 
-Biomechanical motion occurs rapidly and requires high sampling rates to capture peak acceleration during athletic impacts. In contrast, physiological parameters change gradually. To optimize MCU processing without thread starvation, the firmware executes a cooperative dual-rate scheduler:
+### A. Biomechanical Motion & Orientation (200 Hz Sampling)
+Tri-axial accelerometer ($a_x, a_y, a_z$) and gyroscope readings ($\omega_x, \omega_y, \omega_z$) are processed using trigonometry to eliminate gravitational drift:
 
-### A. High-Speed Kinematics Thread (200 Hz / 5 ms Interval)
-- **Squat Repetition Counter**: Tracks vertical acceleration displacement along the y-axis with hysteresis thresholds to prevent double-counting.
-- **Posture & Spine Inclination**: Calculates pitch and roll orientation angles using Euler trigonometry:
-  $$\text{Pitch} = \text{atan2}(-a_x, \sqrt{a_y^2 + a_z^2}) \times \frac{180}{\pi}$$
-  $$\text{Roll} = \text{atan2}(a_y, a_z) \times \frac{180}{\pi}$$
-- **Impact Thresholding**: Monitors vector magnitude $A = \sqrt{a_x^2 + a_y^2 + a_z^2}$. Impacts exceeding $2.8\text{g}$ trigger immediate alerts.
+$$\text{Pitch } (\theta) = \text{atan2}\left(-a_x,\, \sqrt{a_y^2 + a_z^2}\right) \times \frac{180}{\pi}$$
 
-### B. Physiological Vitals Thread (25 Hz / 40 ms Interval)
-- **16-Tap FIR Low-Pass Filter**: Denoises raw optical photoplethysmogram (PPG) samples with a $4\text{ Hz}$ cutoff to eliminate high-frequency motion artifacts.
-- **Heart Rate**: Detects systolic peaks and calculates Inter-Beat Interval (IBI):
-  $$\text{HR (BPM)} = \frac{60000}{\text{IBI (ms)}}$$
-- **$\text{SpO}_2$ Ratio-of-Ratios**: Compares normalized AC and DC components of Red and Infrared wavelengths:
-  $$R = \frac{(AC/DC)_{\text{red}}}{(AC/DC)_{\text{IR}}}$$
-  $$\text{SpO}_2 = 110 - 25 \cdot R$$
-- **Validated Accuracy**: Heart Rate Mean Absolute Error (MAE) of **$2.1\text{ BPM}$**, $\text{SpO}_2$ Root Mean Square Error (RMSE) of **$1.3\%$**.
+$$\text{Roll } (\phi) = \text{atan2}\left(a_y,\, a_z\right) \times \frac{180}{\pi}$$
 
----
+$$\text{Total Vector Acceleration } (A) = \sqrt{a_x^2 + a_y^2 + a_z^2}$$
 
-## 3. Embedded Machine Learning Fall Detection
+- **Squat Detection**: Evaluates $a_y$ displacement with dynamic hysteresis thresholds ($A_{\text{low}} < -0.4\text{g}$, $A_{\text{high}} > 0.6\text{g}$) and a minimum repetition refractory period of $1200\text{ ms}$ to eliminate false double-counts.
 
-To avoid false alarms from simple threshold spikes (e.g., jumping or sitting quickly), the system features a 2-stage verification:
-1. **Stage 1 (Heuristic Filter)**: Checks for rapid transition: Free-fall ($A < 0.5\text{g}$) $\to$ Impact ($A > 2.8\text{g}$) $\to$ Post-fall immobility ($<0.3\text{g}$ for $3\text{ seconds}$).
-2. **Stage 2 (Random Forest Classifier)**:
-   - Evaluates 18 sliding-window features (variance, mean, signal magnitude area).
-   - 100 decision trees (depth $\le 8$) trained on the MobiAct dataset + physical device recordings.
-   - Compiled to native C via `m2cgen` for zero-overhead MCU execution (**18 ms inference latency**, **93.9% F1-score**).
+### B. Physiological Signal Conditioning (25 Hz Sampling)
+1. **16-Tap Finite Impulse Response (FIR) Filter**:
+   $$y[n] = \sum_{k=0}^{15} h[k] \cdot x[n-k]$$
+   Coefficients are optimized with a normalized cutoff $f_c = 4.0\text{ Hz}$ to suppress high-frequency muscle tremor noise and baseline wander.
 
-### Emergency Encrypted QR (EEQA)
-Upon verified fall emergencies, the OLED switches into rescue mode, rendering an on-screen encrypted QR code in **$120\text{ ms}$** containing vital patient info:
+2. **Heart Rate (HR)**:
+   Detected systolic inflection points calculate the Inter-Beat Interval (IBI):
+   $$\text{HR (BPM)} = \frac{60{,}000}{\text{IBI (ms)}}$$
+
+3. **Blood Oxygen Saturation ($\text{SpO}_2$)**:
+   $$\text{Ratio } R = \frac{(V_{\text{AC}} / V_{\text{DC}})_{\text{Red}}}{(V_{\text{AC}} / V_{\text{DC}})_{\text{IR}}}$$
+   $$\text{SpO}_2 = 110.0 - 25.0 \cdot R$$
+   - **Clinical Validation**: Heart Rate Mean Absolute Error (MAE) of **$2.1\text{ BPM}$**, $\text{SpO}_2$ Root Mean Square Error (RMSE) of **$1.3\%$**.
+
+### C. Emergency Encrypted Quick Response (EEQA)
+Upon confirmed fall detection, patient medical metadata is encrypted on-chip using a byte-wise stream cipher:
+
 $$C_i = P_i \oplus K_{i \bmod m}$$
-Total emergency detection-to-display latency: **$340\text{ ms}$**.
+
+The encrypted payload is rendered on the onboard SSD1306 OLED as a QR code within **$120\text{ ms}$**, enabling emergency medical responders to scan patient history securely. Total end-to-end event-to-display latency is **$340\text{ ms}$**.
 
 ---
 
-## 4. Software Dashboard Stack
+## 3. Hardware Interfacing & Pin Assignments
 
-- **Backend (`dashboard/backend/`)**: Node.js & Express server receiving telemetry over HTTP REST (`POST /api/telemetry`), exposing live WebSocket and Server-Sent Event (SSE) endpoints.
-- **Frontend (`dashboard/frontend/`)**: Modern React application displaying:
-  - Real-time gauge cards for Heart Rate and $\text{SpO}_2$
-  - Active squat repetition counter with set targets
-  - 60-second rolling trend line charts using Chart.js
-  - Instant alert banner for abnormal posture and fall events
+| Subsystem | Sensor / Module | Interface | ESP32 Pinout | Operational Voltage | Function |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| **Motion** | MPU-6050 (6-DOF) | I²C Bus | `SDA: GPIO 21`, `SCL: GPIO 22` | 3.3V | 3-axis accelerometer ($\pm 8\text{g}$) & 3-axis gyro |
+| **Vitals** | MAX30102 / MAX30105 | I²C Bus | `SDA: GPIO 21`, `SCL: GPIO 22` | 3.3V / 1.8V | Optical dual-wavelength PPG pulse oximetry |
+| **Display** | SSD1306 128×64 OLED | I²C Bus | `SDA: GPIO 21`, `SCL: GPIO 22` | 3.3V | Real-time vitals, posture indicator, and EEQA QR |
+| **Buzzer** | Active Piezo Buzzer | GPIO Output | `GPIO 13` | 3.3V | Audible alarm upon confirmed fall event |
+| **LED** | Bi-Color Alert LED | GPIO Output | `GPIO 12` | 3.3V | Visual fault and status indicator |
 
 ---
 
-## 5. How to Run & Deploy
+## 4. Software Stack & API Specifications
 
-### 1. Flash the ESP32 Firmware
-- Open [`firmware/athlete_monitoring_firmware.ino`](firmware/athlete_monitoring_firmware.ino) in Arduino IDE.
-- Select Board: `ESP32 Dev Module` or `ESP32-S3`.
-- Configure Wi-Fi credentials and target backend IP.
-- Compile and flash at **115200 baud**.
+### Backend (Node.js & Express)
+The backend service ingests real-time JSON frames over HTTP POST and broadcasts updates to connected dashboard clients via WebSockets:
 
-### 2. Start the Backend Server
+| Method | Endpoint | Description | Payload Format |
+| :---: | :--- | :--- | :--- |
+| `POST` | `/api/telemetry` | Receives sensor frames from ESP32 | `{"hr": 74, "spo2": 98.2, "squats": 12, "pitch": -4.2, "fall": false}` |
+| `GET` | `/api/status` | Queries current athlete operational state | Returns aggregated latest vitals and alert status |
+| `WS` | `/ws/live` | WebSocket stream for 25 Hz updates | Broadcasts streaming telemetry directly to frontend |
+
+### Frontend (React 18 Dashboard)
+Located in `dashboard/frontend/`:
+- **Kinematic Monitor**: Real-time canvas rendering spine pitch/roll inclination and squat repetition tally.
+- **Cardiovascular Monitor**: Live SVG waveform visualization of filtered PPG pulses, heart rate trends, and $\text{SpO}_2$ bar charts.
+- **Emergency Alert Modal**: Automatically triggers on incoming fall packets, presenting emergency geolocation and QR decryption utilities.
+
+---
+
+## 5. Directory Layout
+
+```
+Real-Time-Athlete-Monitoring/
+├── README.md                           # Master system specification
+├── .gitignore                          # Build and dependency exclusions
+├── firmware/
+│   ├── athlete_monitoring_firmware.ino # Dual-rate cooperative firmware
+│   └── platformio.ini                  # PlatformIO compilation environment
+├── tools/
+│   └── validate_vitals_algorithm.py    # Offline FIR filter, HR/SpO2, and fall validator
+├── dashboard/
+│   ├── backend/                        # Node.js REST API & WebSocket server
+│   │   ├── server.js
+│   │   └── package.json
+│   └── frontend/                       # React 18 dashboard interface
+│       ├── src/
+│       ├── public/
+│       └── package.json
+└── docs/
+    └── Sensors.pdf                     # 8-Page peer-reviewed research paper
+```
+
+---
+
+## 6. Build & Execution Quick Start
+
+### 1. Firmware Upload (PlatformIO)
 ```bash
+cd firmware
+pio run -t upload
+pio device monitor -b 115200
+```
+
+### 2. Algorithm Verification Harness (Python)
+```bash
+python tools/validate_vitals_algorithm.py
+```
+
+### 3. Dashboard Server Launch
+```bash
+# Start Backend
 cd dashboard/backend
 npm install
-npm start
-# Server starts on http://localhost:5000
-```
+node server.js
 
-### 3. Launch the React Dashboard
-```bash
+# Start Frontend (in separate terminal)
 cd dashboard/frontend
 npm install
 npm start
-# Dashboard opens on http://localhost:3000
 ```
 
 ---
 
-## 6. Repository File Structure
+## 7. Authors & Academic Citation
 
-```text
-Real-Time-Athlete-Monitoring/
-├── README.md
-├── .gitignore
-│
-├── firmware/
-│   └── athlete_monitoring_firmware.ino    # Multi-rate cooperative scheduling firmware
-│
-├── dashboard/
-│   ├── backend/
-│   │   ├── package.json
-│   │   └── server.js                      # Express telemetry receiver and API server
-│   └── frontend/
-│       ├── package.json
-│       ├── public/
-│       └── src/
-│           ├── App.js                     # Main interactive athlete dashboard UI
-│           ├── App.css
-│           └── index.js
-│
-└── docs/
-    └── Sensors_Athlete_Wearable_Paper.pdf # 8-page published technical paper (VIT SENSE)
-```
+- **Lead Engineer**: Hari Kruthik SK  
+- **Faculty Supervisor**: Dr. Zachariah C. Alex  
+- **Institution**: School of Electronics Engineering (SENSE), Vellore Institute of Technology (VIT), Vellore  
+- **Publication**: Published research documentation available in [`docs/Sensors.pdf`](docs/Sensors.pdf).
+- **License**: Released under the [MIT License](LICENSE).
